@@ -36,6 +36,13 @@ def intToBytes(x):
     b4 = x / 256
     return [chr(b4), chr(b3), chr(b2), chr(b1)]
 
+def getKey(data):
+    if "\x00" in data:
+        p = data.index("\x00")
+        return ("".join(data[:p]), p)
+    else:
+        return ("", -1)
+
 class InvalidPNG(Exception):
     pass
 
@@ -49,7 +56,8 @@ class Chunk(object):
     data = None
     crc = 0
     crcbytes = []
-    
+    key = ""                    # for tEXt chunks
+
     def readFromStream(self, s, data='all'):
         """Fill this chunk with data from stream `s'. If `data' is `all', 
 always reads the data portion of the chunk. If `data' is `text', only
@@ -60,6 +68,8 @@ reads it for tEXt chunks. Otherwise, the data portion is skipped."""
         if data == 'all' or (data == 'text' and self.tag == 'tEXt'):
             self.data = readBytes(s, self.length)
             self.crcbytes = readBytes(s, 4)
+            (key, p) = getKey(self.data)
+            self.key = key
         else:
             s.seek(s.tell() + self.length + 4)
 
@@ -94,16 +104,24 @@ class PNGfile(object):
                     self.chunks.append(c)
 
     def addTextChunk(self, key, text):
+        c = None
+        for w in self.chunks:
+            if w.tag == 'tEXt' and w.key == key:
+                c = w
+                break
+        if not c:
+            c = Chunk()
+            c.tag = 'tEXt'
+            self.chunks.append(c)
+            
         data = key + chr(0) + text
-        c = Chunk()
-        c.tag = 'tEXt'
         c.data = data
         c.length = len(data)
         c.lenbytes = intToBytes(c.length)
         crc = crc32('tEXt')
         c.crc = crc32(data, crc) & 0xffffffff
         c.crcbytes = intToBytes(c.crc)
-        self.chunks.append(c)
+        return c
                     
     def writeToPNGfile(self, filename):
         sys.stderr.write("*** Writing image to PNG file {}\n".format(filename))
@@ -144,7 +162,9 @@ class Main(object):
                 prev = ""
             elif prev == "-r":
                 self.setMode("retrieve")
-                self.comments.append(a)
+                parts = a.split(",")
+                for k in parts:
+                    self.comments.append(k)
                 prev = ""
             elif prev == "-d":
                 self.setMode("delete")
@@ -178,18 +198,29 @@ Usage: {} [options] PNGfile.png
 Text comments consist of a `key' and its associated `text'. When called with no arguments,
 this program displays the keys found in the PNG file, one per line. To add a new comment,
 use the -a argument followed by a string of the form `key,text'. Note that multiple -a 
-options can be supplied on the command line. This command generates a new PNG file that 
-will be written to standard output, or to the file specified with the -o option. If -O
-is supplied instead, the program will overwrite the input PNG file.
+options can be supplied on the command line. If a key is already present in the PNG file,
+its text will be overwritten with the supplied one. 
 
 Comments can also be read from a file, specified with the -f option. This file should
 be in tab-delimited format, with keys in the first column and text in the second one.
 Lines starting with `#' or that do not contain at least two columns are ignored.
 
-To retrieve the text associated with a key, use the -r option followed by the key. Note
-that multiple -r options can be supplied on the command line, and all the corresponding
-entries will be written, in the order in which they appear in the PNG file. Results
-are printed to standard output or to the file specified with the -o option.
+To delete one or more comments, use the -d option followed by one or more keys separated
+by commas. Alternatively, multiple -d options can be supplied on the command line.
+
+The three commands above generate a new PNG file that will be written to standard output, 
+or to the file specified with the -o option. If -O is supplied instead, the program will 
+overwrite the input PNG file.
+
+To retrieve the text associated with one or more keys, use the -r option followed by the 
+keys separated by commas. Alternatively, multiple -r options can be supplied on the command
+line. The comments associated with the supplied keys, if present, will be written to the 
+output in the order in which the keys appear on the command line, in the following format:
+
+#key
+text...
+
+Results are printed to standard output or to the file specified with the -o option.
 
 Options:
 
@@ -198,13 +229,14 @@ Options:
          can be repeated on the command line.
   -f F | Add comments reading them from file F. F should be tab-delimited with two
          columns containing key and text respectively.
-  -r R | Retrieve the text associated with key R. If key is found, key and text are 
-         printed to the output separated by a single tab. This option can be repeated 
-         on the command line.
+  -r R | Retrieve the text associated with one or more keys R. For every key present in
+         the PNG file, the corresponding text is printed to the output. Please note that
+         the text may span more than one line. This option can be repeated on the command 
+         line, or multiple keys can be supplied, separated by commas.
   -d D | Delete the text associated with key D.
   -O   | When using -a, -f, or -d, overwrite existing PNG file instead of writing new one.
 
-Example:
+Examples:
 
   # add two text entries to file image.png, writing new image to image2.png
   $ pngnote.py -a "key1,value for the first key" -a "key2,another comment" -o image2.png image.png
@@ -216,7 +248,8 @@ Example:
 
   # retrieve value for key1
   $ pngnote.py -r key1 image2.png
-  key1	value for the first key
+  #key1
+  value for the first key
 
 (c) 2020 A.Riva, ICBR Bioinformatics Core, University of Florida.
 
@@ -282,21 +315,21 @@ Example:
             P = PNGfile(self.infile, data='text')
             for c in P.chunks:
                 if c.tag == 'tEXt':
-                    if "\x00" in c.data:
-                        p = c.data.index("\x00")
-                        key = "".join(c.data[:p])
-                        out.write("{}\n".format(key))
+                    out.write("{}\n".format(c.key))
         
     def retrieve(self):
+        wanted = {}
+        P = PNGfile(self.infile, data='text')
+        for c in P.chunks:
+            if c.tag == 'tEXt':
+                (key, p) = getKey(c.data)
+                if key in self.comments:
+                    wanted[key] = "".join(c.data[p+1:])
+
         with open(self.outfile, "w") as out:
-            P = PNGfile(self.infile, data='text')
-            for c in P.chunks:
-                if c.tag == 'tEXt':
-                    if "\x00" in c.data:
-                        p = c.data.index("\x00")
-                        key = "".join(c.data[:p])
-                        if key in self.comments:
-                            out.write("{}\t{}\n".format(key, "".join(c.data[p+1:])))
+            for key in self.comments:
+                if key in wanted:
+                    out.write("#{}\n{}\n".format(key, wanted[key]))
         
     def deleteText(self):
         newchunks = []
@@ -304,13 +337,11 @@ Example:
             P = PNGfile(self.infile)
             for c in P.chunks:
                 if c.tag == 'tEXt':
-                    if "\x00" in c.data:
-                        p = c.data.index("\x00")
-                        key = "".join(c.data[:p])
-                        if key in self.comments:
-                            sys.stderr.write("*** {} (deleted)\n".format(key))
-                        else:
-                            newchunks.append(c)
+                    (key, p) = getKey(c.data)
+                    if key in self.comments:
+                        sys.stderr.write("*** {} (deleted)\n".format(key))
+                    else:
+                        newchunks.append(c)
                 else:
                     newchunks.append(c)    
         P.chunks = newchunks
